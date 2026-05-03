@@ -5,6 +5,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <format>
 #include <functional>
 #include <mutex>
 #include <optional>
@@ -110,7 +111,7 @@ namespace Threading
         {
             if(&queue == this) return;
 
-            std::scoped_lock {m_mtx, queue.m_mtx};
+            std::scoped_lock sl {m_mtx, queue.m_mtx};
             m_itemsStorage.swap(queue.m_itemsStorage);
             std::swap(queue.m_end, m_end);
             std::swap(queue.m_start, m_start);
@@ -196,7 +197,7 @@ namespace Threading
         void Abort();
     
         Job m_job = nullptr;
-        std::chrono::milliseconds m_everyNTime;
+        std::chrono::milliseconds m_everyNTime{ 1 };
         std::optional<std::chrono::steady_clock::time_point> m_lastExecuted = std::nullopt;
         bool m_isAborted = false;
     };
@@ -315,7 +316,7 @@ namespace Threading
 
         private:
         std::vector<std::jthread> m_jthreads;
-        ThreadSafeCircularQueue<Job, 64> m_queue;
+        ThreadSafeCircularQueue<Job, 1024> m_queue;
 
         // Jobs which should be repeated for the specific thread
         // Each thread manages It's own vector of jobs

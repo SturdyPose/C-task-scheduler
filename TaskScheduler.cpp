@@ -3,6 +3,7 @@
 #include <latch>
 #include <stop_token>
 #include <thread>
+#include <format>
 
 namespace Threading
 {
@@ -24,7 +25,7 @@ namespace Threading
     }
 
     TaskScheduler::TaskScheduler(uint32_t nThreads) noexcept
-        : m_repeatableAffinityJobs(nThreads)
+        : m_repeatableAffinityJobs(std::min(nThreads, std::thread::hardware_concurrency()))
         , m_mainThreadId(std::this_thread::get_id())
     {
         std::latch sync {nThreads};
@@ -66,7 +67,7 @@ namespace Threading
                     affinityJobs.ExecuteJobs();
                     
                     // Get all the jobs for the current thread
-                    std::array<Job, 64> jobQueue;
+                    std::array<Job, 1024> jobQueue;
                     auto [span1, span2] = m_queue.SwapBuffers(jobQueue);
                     for (Job &job : span1)
                         job(currentThreadId);
@@ -95,7 +96,8 @@ namespace Threading
         std::thread::id threadID = std::this_thread::get_id();
         if(threadID != m_mainThreadId)
         {
-            throw CallNotFromMainThreadException(std::format("TaskScheduler::AddRecurringJob should be called only from main thread! Called from {} , and main thread id is: {}", threadID, m_mainThreadId));
+            std::string error = std::format("TaskScheduler::AddRecurringJob should be called only from main thread! Called from {} , and main thread id is: {}", threadID, m_mainThreadId);
+            throw CallNotFromMainThreadException(error);
         }
 
         auto* affinityJobs = &m_repeatableAffinityJobs.at(0);
