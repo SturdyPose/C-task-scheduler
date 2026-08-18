@@ -1,5 +1,7 @@
 #pragma once
 
+#include "ThreadSafeContainers.h"
+
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -15,21 +17,10 @@
 #include <thread>
 #include <tuple>
 #include <vector>
+#include <new>
 
 namespace Threading
 {
-    class QueueFullException: public std::exception
-    {
-        std::string message;
-    public:
-        explicit QueueFullException(const std::string &msg) : message(msg) {}
-
-        const char *what() const noexcept override
-        {
-            return message.c_str();
-        }
-    };
-
     class RecurringJobFullException: public std::exception
     {
         std::string message;
@@ -54,135 +45,26 @@ namespace Threading
         }
     };
 
-    template <typename T, size_t N>
-    struct ThreadSafeCircularQueue final
-    {
-        void Push(T&& item)
-        {
-            std::unique_lock lg{m_mtx};
-            int nextStart = Increment(m_start);
-            if(nextStart == m_end)
-            {
-                throw QueueFullException("ThreadSafeCircularQueue is full");
-            }
-
-            m_itemsStorage[nextStart] = std::forward<T>(item);
-            m_start = nextStart;
-
-            if (m_end == -1) m_end = 0;
-        }
-
-        std::optional<T> PopSafe()
-        {
-            std::unique_lock lg{m_mtx};
-            if (m_start == -1) return std::nullopt;
-
-            int nextEnd = Increment(m_end);
-            T temp = std::move(m_itemsStorage[m_end]);
-
-            if (m_start == m_end)
-            {
-                m_start = -1;
-                m_end = -1;
-            }
-            else
-            {
-                m_end = nextEnd;
-            }
-
-            return temp;
-        }
-
-        bool IsEmpty() const noexcept 
-        {
-            return Size() == 0;
-        }
-
-        int Size() const noexcept 
-        {
-            std::unique_lock ul{m_mtx};
-            if (m_start == -1)
-                return 0;
-
-            return (m_start - m_end + static_cast<int>(N)) % static_cast<int>(N) + 1;
-        }
-
-        void Swap(ThreadSafeCircularQueue<T, N>& queue) noexcept
-        {
-            if(&queue == this) return;
-
-            std::scoped_lock sl {m_mtx, queue.m_mtx};
-            m_itemsStorage.swap(queue.m_itemsStorage);
-            std::swap(queue.m_end, m_end);
-            std::swap(queue.m_start, m_start);
-        }
-
-        /*
-        Use SwapBuffers when you want to get whole ownership of insides so Thread doesn't hold on to the
-        resource longer than it needs
-
-        Example:
-
-        ThreadSafeCircularQueue<int, 64> queue;
-        *** do something with queue
-
-        std::array<int, 64> someBuff;
-
-        Because circular queue is disjointed, you'll have two spans
-        auto [span1, span2] = queue.SwapBuffers(someBuff);
-
-        for(int i : span1)
-        {
-            // process the buffer safely without locking threads 
-        }
-        for(int i : span2)
-        {
-            // process the buffer safely without locking threads 
-        }
-
-        For future: c++26 will have std::views::concat available
-        */
-        std::pair<std::span<T>, std::span<T>> SwapBuffers(std::array<T, N>& buffer, int start = -1, int end = -1)
-        {
-            const int buffSize = static_cast<int>(buffer.size());
-            if(start >= buffSize || end >= buffSize) throw QueueFullException(std::format("Circular buffer indices can't be bigger than buffer itself start: {} end: {}", start, end));
-            std::unique_lock lg{m_mtx};
-            m_itemsStorage.swap(buffer);
-
-            std::swap(m_start, start);
-            std::swap(m_end, end);
-
-            if (start == -1) return {{}, {}};
-
-            if (start >= end)
-            {
-                return {
-                    std::span<T>{buffer.begin() + (end), buffer.begin() + (start + 1)},
-                    std::span<T>{}};
-            }
-            else
-            {
-                return {
-                    std::span<T>{buffer.begin() + end, buffer.end()},
-                    std::span<T>{buffer.begin(), buffer.begin() + (start + 1)}};
-            }
-        }
-
-        private: 
-        int Increment(int val) const noexcept
-        {
-            return (val == -1) ? 0 : (val + 1) % static_cast<int>(N);
-        }
-
-        std::array<T, N> m_itemsStorage;
-
-        int m_start = -1;
-        int m_end = -1;
-
-        mutable std::mutex m_mtx;
-    };
 
     using Job = std::function<void(std::thread::id)>;
+
+    // TODO: Make AlignedJob take arbitrary arguments
+    struct alignas(64) AlignedJob
+    {
+        template <typename F>
+        AlignedJob(F &&f) : m_job(std::forward<F>(f)) {}
+        AlignedJob() : m_job(nullptr) {}
+        AlignedJob(std::nullptr_t) : m_job(nullptr) {}
+        bool operator!=(std::nullptr_t) const { return m_job != nullptr; }
+        void operator()(std::thread::id id)
+        {
+            if (m_job)
+                m_job(id);
+        }
+
+        private:
+        Job m_job; 
+    };
 
     struct RecurringJob final
     {
@@ -202,11 +84,11 @@ namespace Threading
         bool m_isAborted = false;
     };
 
+    using RecurringJobHandler = size_t;
+
     template <size_t N>
     struct RecurringJobContainer final
     {
-        using RecurringJobHandler = size_t;
-
         RecurringJobContainer()
         {
             for(size_t i = 0; i < N; ++i)
@@ -217,12 +99,12 @@ namespace Threading
 
         RecurringJobHandler AddJob(RecurringJob&& job)
         {
+            std::unique_lock lock(m_freeIndicesMtx);
             if (m_freeIndices.empty())
             {
                 throw RecurringJobFullException(std::format("Can't fit more jobs, {} is the limit", N));
             }
 
-            std::unique_lock lock(m_freeIndicesMtx);
             size_t index = m_freeIndices.top();
             m_freeIndices.pop();
             m_backFillQueue.Push({std::forward<RecurringJob>(job), index});
@@ -254,7 +136,7 @@ namespace Threading
 
         void ExecuteJobs()
         {
-            std::array<std::pair<RecurringJob, size_t>, 16> jobs;
+            std::array<std::pair<RecurringJob, size_t>, N> jobs;
             auto [span1, span2] = m_backFillQueue.SwapBuffers(jobs);
             for (auto& [job, index] : span1)
             {
@@ -265,6 +147,7 @@ namespace Threading
                 m_recurringJobs[index] = std::move(job);
             }
 
+            // Execute jobs as separate loop as it can otherwise have odd timing
             for(RecurringJob& job : m_recurringJobs)
             {
                 if(!job.IsAborted()) job.Execute();
@@ -296,7 +179,13 @@ namespace Threading
         std::mutex m_freeIndicesMtx;
         std::stack<size_t> m_freeIndices;
         // job - index pair
-        ThreadSafeCircularQueue<std::pair<RecurringJob, size_t>, 16> m_backFillQueue;
+        ThreadSafeCircularQueue<std::pair<RecurringJob, size_t>, N> m_backFillQueue;
+    };
+
+    struct RecurringJobID final
+    {
+        RecurringJobHandler handler;
+        size_t whichContainerIndex;
     };
 
     // Should be constructed only on main thread
@@ -310,21 +199,29 @@ namespace Threading
         [[nodiscard]] TaskScheduler& operator=(const TaskScheduler&) noexcept = delete;
         [[nodiscard]] TaskScheduler& operator=(TaskScheduler&&) noexcept = delete;
 
-        void AddJob(Job&& job);
-        void AddRecurringJob(RecurringJob&& job);
-        void AddRecurringJob(Job&& job, std::chrono::milliseconds everyMs);
+        void AddJob(AlignedJob&& job);
+        [[nodiscard]] RecurringJobID AddRecurringJob(RecurringJob&& job);
+        [[nodiscard]] RecurringJobID AddRecurringJob(Job&& job, std::chrono::milliseconds everyMs);
+        void RemoveRecurringJob(RecurringJobID jobID);
 
         private:
-        std::vector<std::jthread> m_jthreads;
-        ThreadSafeCircularQueue<Job, 1024> m_queue;
+        void CheckIfOnMainThread() const;
 
-        // Jobs which should be repeated for the specific thread
+        std::vector<std::jthread> m_jthreads;
+        ThreadSafeVector<AlignedJob> m_jobs;
+
+        // Jobs which should be repeated for the specific thread:
         // Each thread manages It's own vector of jobs
+        // This container is stable and doesn't resize
         std::vector<RecurringJobContainer<32>> m_repeatableAffinityJobs;
 
-        std::mutex m_mtx;
+        alignas(64) std::mutex m_mtx;
         std::condition_variable m_cond;
         std::thread::id m_mainThreadId;
     };
 
+
+    void CreateTaskScheduler(uint32_t nThreads);
+
+    TaskScheduler& GetTaskScheduler();
 }
